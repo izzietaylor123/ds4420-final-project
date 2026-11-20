@@ -18,100 +18,17 @@ Usage:
 
 import argparse
 from pathlib import Path
+from loading_data import load_data, build_seen
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 
-DATA = Path(__file__).parent / "data"
 CKPT = Path(__file__).parent / "mlp_model.pt"
 
 
-# --------------------------------------------------------------------------- #
-# Data
-# --------------------------------------------------------------------------- #
-def load_data(sample_users, min_movie_ratings, min_tag_count, max_tags, seed, keep_users=()):
-    """Read the CSVs and build index maps plus per-movie feature tables."""
-    rng = np.random.default_rng(seed)
 
-    print("Reading rating.csv ...")
-    ratings = pd.read_csv(
-        DATA / "rating.csv",
-        usecols=["userId", "movieId", "rating"],
-        dtype={"userId": np.int32, "movieId": np.int32, "rating": np.float32},
-    )
-    if sample_users and sample_users < ratings["userId"].nunique():
-        users = ratings["userId"].unique()
-        chosen = set(rng.choice(users, sample_users, replace=False).tolist()) | set(keep_users)
-        ratings = ratings[ratings["userId"].isin(chosen)]
-
-    counts = ratings["movieId"].value_counts()
-    ratings = ratings[ratings["movieId"].isin(counts[counts >= min_movie_ratings].index)]
-    ratings = ratings.reset_index(drop=True)
-
-    user_ids = np.sort(ratings["userId"].unique())
-    movie_ids = np.sort(ratings["movieId"].unique())
-    user2idx = {u: i for i, u in enumerate(user_ids)}
-    movie2idx = {m: i for i, m in enumerate(movie_ids)}
-    ratings["u"] = ratings["userId"].map(user2idx).astype(np.int64)
-    ratings["m"] = ratings["movieId"].map(movie2idx).astype(np.int64)
-    n_movies = len(movie_ids)
-
-    # --- genres: multi-hot -------------------------------------------------
-    movies = pd.read_csv(DATA / "movie.csv").set_index("movieId").loc[movie_ids]
-    genre_lists = movies["genres"].str.split("|")
-    genres = sorted({g for gl in genre_lists for g in gl if g != "(no genres listed)"})
-    g2i = {g: i for i, g in enumerate(genres)}
-    genre_mat = np.zeros((n_movies, len(genres)), dtype=np.float32)
-    for row, gl in enumerate(genre_lists):
-        for g in gl:
-            if g in g2i:
-                genre_mat[row, g2i[g]] = 1.0
-
-    # --- tags: padded index matrix (0 = padding) ----------------------------
-    tags = pd.read_csv(DATA / "tag.csv", usecols=["movieId", "tag"]).dropna()
-    tags["tag"] = tags["tag"].astype(str).str.lower().str.strip()
-    tags = tags[tags["movieId"].isin(movie2idx)]
-    tag_counts = tags["tag"].value_counts()
-    vocab = tag_counts[tag_counts >= min_tag_count].index
-    t2i = {t: i + 1 for i, t in enumerate(vocab)}  # 0 reserved for padding
-    tags = tags[tags["tag"].isin(t2i)]
-    # per-movie most frequent tags first, capped at max_tags
-    per_movie = tags.groupby(["movieId", "tag"]).size().rename("n").reset_index()
-    per_movie = per_movie.sort_values(["movieId", "n"], ascending=[True, False])
-    per_movie["pos"] = per_movie.groupby("movieId").cumcount()
-    per_movie = per_movie[per_movie["pos"] < max_tags]
-    tag_mat = np.zeros((n_movies, max_tags), dtype=np.int64)
-    tag_mat[per_movie["movieId"].map(movie2idx).to_numpy(), per_movie["pos"].to_numpy()] = (
-        per_movie["tag"].map(t2i).to_numpy()
-    )
-
-    print(
-        f"{len(ratings):,} ratings | {len(user_ids):,} users | {n_movies:,} movies | "
-        f"{len(genres)} genres | {len(vocab):,} tags "
-        f"({(tag_mat[:, 0] > 0).mean():.1%} of movies have tags)"
-    )
-    return dict(
-        ratings=ratings, user_ids=user_ids, movie_ids=movie_ids, user2idx=user2idx,
-        titles=movies["title"].to_numpy(), genre_names=genres, genre_mat=genre_mat,
-        tag_mat=tag_mat, n_tags=len(vocab) + 1,
-        movie_counts=ratings["m"].value_counts().reindex(range(n_movies), fill_value=0).to_numpy(),
-    )
-
-
-def build_seen(ratings, n_users):
-    """CSR-style (indptr, items) of the movies each user has already rated."""
-    r = ratings.sort_values("u")
-    indptr = np.zeros(n_users + 1, dtype=np.int64)
-    np.cumsum(np.bincount(r["u"].to_numpy(), minlength=n_users), out=indptr[1:])
-    return indptr, r["m"].to_numpy()
-
-
-# --------------------------------------------------------------------------- #
-# Model
-# --------------------------------------------------------------------------- #
-class RecMLP(nn.Module):
+class RecMLP(nn.Module): # simple multi-layer perceptron for movie recommendation
     def __init__(self, n_users, n_movies, genre_mat, tag_mat, n_tags,
                  emb_dim=32, tag_dim=32, hidden=(128, 64), dropout=0.2, global_mean=0.0):
         super().__init__()
@@ -120,28 +37,28 @@ class RecMLP(nn.Module):
         # Average tag embedding: padding (id 0) is masked out of the mean, and
         # movies with no tags yield a zero vector.
         self.tag_emb = nn.Embedding(n_tags, tag_dim, padding_idx=0)
-        self.register_buffer("genre_mat", torch.as_tensor(genre_mat))
-        self.register_buffer("tag_mat", torch.as_tensor(tag_mat))
-        self.register_buffer("global_mean", torch.tensor(float(global_mean)))
+        self.register_buffer("genre_mat", torch.as_tensor(genre_mat)) # register genre_mat as a buffer so it is not a parameter to be learned, but still part of the model's state
+        self.register_buffer("tag_mat", torch.as_tensor(tag_mat)) # same with tag_mat
+        self.register_buffer("global_mean", torch.tensor(float(global_mean))) # same with global_mean
 
-        layers, d = [], emb_dim * 2 + genre_mat.shape[1] + tag_dim
-        for h in hidden:
+        layers, d = [], emb_dim * 2 + genre_mat.shape[1] + tag_dim # input dimension is the concatenation of user embedding, movie embedding, genre multi-hot, and average tag embedding
+        for h in hidden: # add hidden layers with ReLU activation and dropout
             layers += [nn.Linear(d, h), nn.ReLU(), nn.Dropout(dropout)]
             d = h
         layers.append(nn.Linear(d, 1))
-        self.mlp = nn.Sequential(*layers)
-        for e in (self.user_emb, self.movie_emb, self.tag_emb):
+        self.mlp = nn.Sequential(*layers) # create the MLP as a sequential model
+        for e in (self.user_emb, self.movie_emb, self.tag_emb): # initialize the embeddings with a normal distribution
             nn.init.normal_(e.weight, std=0.05)
-        with torch.no_grad():
+        with torch.no_grad(): # zero out the padding embedding for tags so that it does not contribute to the average tag embedding
             self.tag_emb.weight[0].zero_()
 
-    def avg_tag_embedding(self, m):
+    def avg_tag_embedding(self, m): # compute the average tag embedding for a batch of movies m
         ids = self.tag_mat[m]                          # (B, max_tags)
         mask = (ids > 0).unsqueeze(-1).float()
         summed = (self.tag_emb(ids) * mask).sum(1)
         return summed / mask.sum(1).clamp(min=1.0)
 
-    def forward(self, u, m):
+    def forward(self, u, m): # compute the forward pass for a batch of user indices u and movie indices m
         x = torch.cat(
             [self.user_emb(u), self.movie_emb(m), self.genre_mat[m], self.avg_tag_embedding(m)],
             dim=1,
@@ -149,10 +66,9 @@ class RecMLP(nn.Module):
         return self.mlp(x).squeeze(1) + self.global_mean  # logit (like) or rating
 
 
-# --------------------------------------------------------------------------- #
-# Training / evaluation
-# --------------------------------------------------------------------------- #
-def pick_device():
+# Training + evaluation ------------------------------------------------------------- #
+
+def pick_device(): # pick the device to run the model on (GPU if available, otherwise CPU)
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -160,28 +76,28 @@ def pick_device():
     return "cpu"
 
 
-def make_target(r, target, thr):
+def make_target(r, target, thr): # convert the ratings r to the appropriate target format based on the specified target and threshold
     return (r >= thr).float() if target == "like" else r
 
 
 @torch.no_grad()
-def evaluate(model, u, m, r, target, thr, bs=65536):
+def evaluate(model, u, m, r, target, thr, bs=65536): # evaluate the model on a batch of user indices u, movie indices m, and ratings r, using the specified target and threshold
     model.eval()
     out = torch.cat([model(u[i:i + bs], m[i:i + bs]) for i in range(0, len(u), bs)])
-    if target == "like":
+    if target == "like": # if the target is "like", compute the binary cross-entropy loss and accuracy
         y = (r >= thr).float()
         bce = nn.functional.binary_cross_entropy_with_logits(out, y).item()
         acc = ((out > 0).float() == y).float().mean().item()
         return {"bce": bce, "acc": acc}
     pred = out.clamp(0.5, 5.0)
-    return {"rmse": ((pred - r) ** 2).mean().sqrt().item(), "mae": (pred - r).abs().mean().item()}
+    return {"rmse": ((pred - r) ** 2).mean().sqrt().item(), "mae": (pred - r).abs().mean().item()} # return the root mean squared error and mean absolute error for the predicted ratings
 
 
-def train(args):
-    torch.manual_seed(args.seed)
+def train(args): # train the model using the specified arguments
+    torch.manual_seed(args.seed) # set the random seed for reproducibility
     d = load_data(args.sample_users, args.min_movie_ratings, args.min_tag_count,
                   args.max_tags, args.seed, keep_users=[args.user_id] if args.user_id else ())
-    df = d["ratings"]
+    df = d["ratings"] # pull out the df
     device = pick_device()
     print("device:", device)
 
@@ -193,7 +109,7 @@ def train(args):
              torch.as_tensor(df["m"].to_numpy()[v], device=device),
              torch.as_tensor(df["rating"].to_numpy()[v], device=device)) for k, v in idx.items()}
 
-    train_mean = float(t["train"][2].mean())
+    train_mean = float(t["train"][2].mean()) # compute the mean rating for the training set, which will be used as a baseline for evaluation
     base = train_mean if args.target == "rating" else 0.0
     model = RecMLP(len(d["user_ids"]), len(d["movie_ids"]), d["genre_mat"], d["tag_mat"], d["n_tags"],
                    args.emb_dim, args.tag_dim, tuple(args.hidden), args.dropout, base).to(device)
@@ -201,78 +117,86 @@ def train(args):
     loss_fn = nn.BCEWithLogitsLoss() if args.target == "like" else nn.MSELoss()
 
     # baseline for context
-    vu, vm, vr = t["val"]
+    vu, vm, vr = t["val"] # pull out the validation set user indices, movie indices, and ratings
     if args.target == "rating":
         print(f"baseline (predict train mean) val RMSE: {((vr - train_mean) ** 2).mean().sqrt():.4f}")
 
-    u, m, r = t["train"]
-    best, best_state, bad = float("inf"), None, 0
-    for epoch in range(1, args.epochs + 1):
-        model.train()
+    u, m, r = t["train"] # pull out the training set user indices, movie indices, and ratings
+    best, best_state, bad = float("inf"), None, 0 # initialize the best score, best model state, and bad epoch counter for early stopping
+    for epoch in range(1, args.epochs + 1): # repeats through epochs
+        model.train() # set the model to training mode
         order = torch.randperm(len(u), device=device)
         total = 0.0
-        for i in range(0, len(u), args.batch_size):
-            b = order[i:i + args.batch_size]
-            opt.zero_grad()
-            loss = loss_fn(model(u[b], m[b]), make_target(r[b], args.target, args.like_threshold))
-            loss.backward()
-            opt.step()
-            total += loss.item() * len(b)
-        val = evaluate(model, vu, vm, vr, args.target, args.like_threshold)
-        score = val["rmse"] if args.target == "rating" else val["bce"]
+        for i in range(0, len(u), args.batch_size): # iterate through the training set in batches of size args.batch_size
+            b = order[i:i + args.batch_size] # get the indices for the current batch
+            opt.zero_grad() # zero the gradients for the optimizer
+            loss = loss_fn(model(u[b], m[b]), make_target(r[b], args.target, args.like_threshold)) # compute the loss for the current batch
+            loss.backward() # backpropagate the loss to compute gradients
+            opt.step() # update the model parameters using the optimizer
+            total += loss.item() * len(b) # accumulate the total loss for the epoch
+        val = evaluate(model, vu, vm, vr, args.target, args.like_threshold) # evaluate the model on the validation set and get the evaluation metrics
+        score = val["rmse"] if args.target == "rating" else val["bce"] # choose the appropriate score for early stopping based on the target
         print(f"epoch {epoch:02d} train_loss {total / len(u):.4f} val {val}")
-        if score < best - 1e-4:
+        if score < best - 1e-4: # if the current score is better than the best score by a small margin, update the best score and save the model state
             best, bad = score, 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
-            if bad >= args.patience:
+            if bad >= args.patience: # if the model has not improved for args.patience epochs, stop training early
                 print("early stopping")
                 break
 
-    model.load_state_dict(best_state)
-    print("test:", evaluate(model, *t["test"], args.target, args.like_threshold))
+    model.load_state_dict(best_state) # load the best model state after training is complete
+    print("test:", evaluate(model, *t["test"], args.target, args.like_threshold)) # evaluate the model on the test set and print the evaluation metrics
 
-    indptr, items = build_seen(df, len(d["user_ids"]))
-    torch.save({
+    indptr, items, seen_ratings = build_seen(df, len(d["user_ids"])) # get the seen movies so we can remove them from the recommendation list
+    torch.save({ # save the model state, configuration, and other relevant data to a checkpoint file so we can access it without retraining
         "state": {k: v.cpu() for k, v in model.state_dict().items()},
         "config": dict(n_users=len(d["user_ids"]), n_movies=len(d["movie_ids"]), n_tags=d["n_tags"],
                        emb_dim=args.emb_dim, tag_dim=args.tag_dim, hidden=tuple(args.hidden),
                        dropout=args.dropout, target=args.target, like_threshold=args.like_threshold),
         "user_ids": d["user_ids"], "movie_ids": d["movie_ids"], "titles": d["titles"],
         "genre_mat": d["genre_mat"], "tag_mat": d["tag_mat"], "movie_counts": d["movie_counts"],
-        "seen_indptr": indptr, "seen_items": items,
+        "seen_indptr": indptr, "seen_items": items, "seen_ratings": seen_ratings,
     }, CKPT)
     print("saved", CKPT)
 
 
-# --------------------------------------------------------------------------- #
-# Recommendation
-# --------------------------------------------------------------------------- #
+# Recommendation ------------------------------------------------------------- #
+"""
+Recommends movies to a specific user without training the model (need to run training first)
+* user_id : MovieLens userId to recommend for
+* top_k : number of recommendations to return
+* min_count : only recommend movies with at least this many training ratings
+"""
 @torch.no_grad()
-def recommend(user_id, top_k, min_count):
-    ck = torch.load(CKPT, weights_only=False)
+def recommend(user_id, top_k, min_count): 
+    ck = torch.load(CKPT, weights_only=False) # load the checkpoint file
     c = ck["config"]
     model = RecMLP(c["n_users"], c["n_movies"], ck["genre_mat"], ck["tag_mat"], c["n_tags"],
-                   c["emb_dim"], c["tag_dim"], c["hidden"], c["dropout"])
+                   c["emb_dim"], c["tag_dim"], c["hidden"], c["dropout"]) # initialize the model with the configuration from the checkpoint
     model.load_state_dict(ck["state"])
     model.eval()
 
-    pos = np.searchsorted(ck["user_ids"], user_id)
+    pos = np.searchsorted(ck["user_ids"], user_id) # find the position of the user_id in the sorted list of user_ids from the checkpoint
     if pos >= len(ck["user_ids"]) or ck["user_ids"][pos] != user_id:
-        raise SystemExit(f"user {user_id} was not in the training sample; retrain with --user-id {user_id}")
-    seen = ck["seen_items"][ck["seen_indptr"][pos]:ck["seen_indptr"][pos + 1]]
+        raise SystemExit(f"user {user_id} was not in the training sample; retrain with --user-id {user_id}") # if the user was not specified during training, they may not have been in the random sample and do not have a checkpoint
+    seen = ck["seen_items"][ck["seen_indptr"][pos]:ck["seen_indptr"][pos + 1]] # get the indices of the movies that the user has already rated
 
-    m = torch.arange(c["n_movies"])
-    scores = model(torch.full_like(m, pos), m)
-    if c["target"] == "like":
+    m = torch.arange(c["n_movies"]) # create a tensor of all movie indices
+    scores = model(torch.full_like(m, pos), m) # get the scores for all movies for the specified user
+    if c["target"] == "like": # if the target is "like", apply the sigmoid function to convert logits to probabilities
         scores = torch.sigmoid(scores)
     scores = scores.numpy()
-    scores[seen] = -np.inf                       # only unseen movies
+    scores[seen] = -np.inf # only use unseen movies
     scores[ck["movie_counts"] < min_count] = -np.inf  # skip obscure titles
     label = "P(like)" if c["target"] == "like" else "pred rating"
+    seen_r = ck["seen_ratings"][ck["seen_indptr"][pos]:ck["seen_indptr"][pos + 1]]  # the user's actual ratings
+    print(f"\nUser's top {top_k} rated movies (for context):")
+    for rank, i in enumerate(np.argsort(-seen_r, kind="stable")[:top_k], 1): # print the user's top rated movies to sanity check their recommendations
+        print(f"{rank:2d}. {ck['titles'][seen[i]]:<60} rating: {seen_r[i]:.1f}")
     print(f"\nTop {top_k} recommendations for user {user_id} ({len(seen)} movies already rated):")
-    for rank, i in enumerate(np.argsort(-scores)[:top_k], 1):
+    for rank, i in enumerate(np.argsort(-scores)[:top_k], 1): # print the user's top recommended movies with their predicted ratings
         val = f"{scores[i]:.1%}" if c["target"] == "like" else f"{min(scores[i], 5.0):.2f}"
         print(f"{rank:2d}. {ck['titles'][i]:<60} {label}: {val}")
 
