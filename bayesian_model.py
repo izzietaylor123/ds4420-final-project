@@ -74,7 +74,7 @@ def plot_prior_posterior(user_id, genre, d, post_mean, post_var, prior_mean, pri
     plt.show()
     plt.close()
 
-# training
+# model training and evaluation
 def train():
     # load the movie ratings and features using the same settings as the MLP
     d = load_data(
@@ -198,7 +198,7 @@ def train():
     return d, df, train_df, post_mean, post_var, prior_mean, best_var
 
 
-# Recommendation
+# movie recommendations
 def recommend(user_id, top_k, min_count, d, df, post_mean, prior_mean):
     """Recommend the highest rated unseen movies for a specific user."""
     if user_id not in d["user2idx"]:
