@@ -1,1 +1,7 @@
 .DS_Store
+*.pt
+__pycache__/
+data/posters/
+data/poster_features*.npz
+.env
+models/
