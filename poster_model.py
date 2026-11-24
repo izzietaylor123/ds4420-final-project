@@ -3,9 +3,19 @@ import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from cnn_data import DATA, load_ratings, split
+from loading_data import DATA, load_data
 
 RESULTS = Path(__file__).parent / "results"
+
+
+def load_ratings(sample_users=20000, min_movie_ratings=5, seed=0): # Same data as the MLP and Bayesian model
+    return load_data(sample_users, min_movie_ratings, min_tag_count=2, max_tags=32, seed=seed)
+
+
+def split(n, seed=0):
+    perm = np.random.default_rng(seed).permutation(n)
+    n_val = n_test = int(0.1 * n)
+    return {"test": perm[:n_test], "val": perm[n_test:n_test + n_val], "train": perm[n_test + n_val:]}
 
 KS = [5, 10, 20, 50, 100, 0]
 LAMS = [0.0, 3.0, 10.0, 30.0, 100.0]

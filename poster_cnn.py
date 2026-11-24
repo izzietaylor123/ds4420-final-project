@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from cnn_data import DATA
+from loading_data import DATA
 
 POSTERS = DATA / "posters"
 RESULTS = Path(__file__).parent / "results"

@@ -7,7 +7,8 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from cnn_data import DATA, load_ratings
+from loading_data import DATA
+from poster_model import load_ratings
 
 POSTERS = DATA / "posters"
 API = "https://api.themoviedb.org/3/movie/{}"

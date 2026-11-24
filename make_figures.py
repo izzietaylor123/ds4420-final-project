@@ -52,8 +52,7 @@ def table1_png():
 def history_figure():
     """Prediction error grouped by how many ratings the user has in training."""
     import numpy as np
-    from cnn_data import load_ratings, split
-    from poster_model import PosterSimilarity, load_features, rmse
+    from poster_model import PosterSimilarity, load_features, load_ratings, rmse, split
 
     cnn = load("posters_cnn")
     d = load_ratings()
