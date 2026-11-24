@@ -12,12 +12,16 @@ Target (--target):
   * like   : predict P(will like) = P(rating >= --like-threshold) (BCE)
 
 Usage:
-  python mlp_model.py train --user-id 42 --top-k 10     # train, then recommend
-  python mlp_model.py recommend --user-id 42 --top-k 10 # reuse saved checkpoint
+  python MLP/mlp_model.py train --user-id 42 --top-k 10     # train, then recommend
+  python MLP/mlp_model.py recommend --user-id 42 --top-k 10 # reuse saved checkpoint
 """
 
 import argparse
+import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent)) # loading_data.py lives in the project root
 from loading_data import load_data, build_seen
 
 import numpy as np
@@ -25,6 +29,7 @@ import torch
 import torch.nn as nn
 
 CKPT = Path(__file__).parent / "mlp_model.pt"
+HISTORY = Path(__file__).parent / "mlp_history.json" # per-epoch curves, read by mlp_plots.py
 
 
 
@@ -129,27 +134,43 @@ def train(args): # train the model using the specified arguments
 
     # baselines for context
     vu, vm, vr = t["val"] # pull out the validation set user indices, movie indices, and ratings
+    baselines, baselines_mae = {}, {}
     if args.target == "rating":
-        print(f"baseline (predict train mean) val RMSE: {((vr - train_mean) ** 2).mean().sqrt():.4f}")
+        baselines["global mean"] = ((vr - train_mean) ** 2).mean().sqrt().item()
         mm_pred = torch.as_tensor(movie_mean, device=device)[vm]
-        print(f"baseline (predict movie mean) val RMSE: {((vr - mm_pred) ** 2).mean().sqrt():.4f}")
+        baselines["movie mean"] = ((vr - mm_pred) ** 2).mean().sqrt().item()
+        baselines_mae["global mean"] = (vr - train_mean).abs().mean().item()
+        baselines_mae["movie mean"] = (vr - mm_pred).abs().mean().item()
+        print(f"baseline (predict train mean) val RMSE: {baselines['global mean']:.4f}")
+        print(f"baseline (predict movie mean) val RMSE: {baselines['movie mean']:.4f}")
+    history = {"epochs": [], "train": [], "val": [], # per-epoch curves saved for plotting (RMSE/BCE, then MAE for rating)
+               "mae": {"train": [], "val": [], "baselines": baselines_mae}}
+    best_epoch = 0
     best, best_state, bad = float("inf"), None, 0 # initialize the best score, best model state, and bad epoch counter for early stopping
     for epoch in range(1, args.epochs + 1): # repeats through epochs
         model.train() # set the model to training mode
         order = torch.randperm(len(u), device=device)
-        total = 0.0
+        total, total_abs = 0.0, 0.0
         for i in range(0, len(u), args.batch_size): # iterate through the training set in batches of size args.batch_size
             b = order[i:i + args.batch_size] # get the indices for the current batch
             opt.zero_grad() # zero the gradients for the optimizer
-            loss = loss_fn(model(u[b], m[b]), make_target(r[b], args.target, args.like_threshold)) # compute the loss for the current batch
+            out, y = model(u[b], m[b]), make_target(r[b], args.target, args.like_threshold)
+            loss = loss_fn(out, y) # compute the loss for the current batch
             loss.backward() # backpropagate the loss to compute gradients
             opt.step() # update the model parameters using the optimizer
             total += loss.item() * len(b) # accumulate the total loss for the epoch
+            total_abs += (out.detach() - y).abs().sum().item() # accumulate the absolute error for the train MAE curve
         val = evaluate(model, vu, vm, vr, args.target, args.like_threshold) # evaluate the model on the validation set and get the evaluation metrics
         score = val["rmse"] if args.target == "rating" else val["bce"] # choose the appropriate score for early stopping based on the target
         print(f"epoch {epoch:02d} train_loss {total / len(u):.4f} val {val}")
+        history["epochs"].append(epoch)
+        history["train"].append((total / len(u)) ** 0.5 if args.target == "rating" else total / len(u)) # MSE -> RMSE for rating
+        history["val"].append(score)
+        if args.target == "rating":
+            history["mae"]["train"].append(total_abs / len(u))
+            history["mae"]["val"].append(val["mae"])
         if score < best - 1e-4: # if the current score is better than the best score by a small margin, update the best score and save the model state
-            best, bad = score, 0
+            best, bad, best_epoch = score, 0, epoch
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
@@ -157,6 +178,8 @@ def train(args): # train the model using the specified arguments
                 print("early stopping")
                 break
 
+    HISTORY.write_text(json.dumps({"metric": "RMSE" if args.target == "rating" else "BCE",
+                                   "best_epoch": best_epoch, "baselines": baselines, **history}))
     model.load_state_dict(best_state) # load the best model state after training is complete
     print("test:", evaluate(model, *t["test"], args.target, args.like_threshold)) # evaluate the model on the test set and print the evaluation metrics
 
