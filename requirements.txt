@@ -1,4 +1,9 @@
 numpy
 pandas
+pillow
+requests
+tensorflow
+scikit-learn
+matplotlib
 torch
 matplotlib
