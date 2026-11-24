@@ -57,8 +57,6 @@ def plot_curves(ep, train, val, baselines, best_epoch, metric, out_path):
     ax.tick_params(colors=MUTED)
     ax.set_title(f"MLP training: validation {metric} vs. baselines", color=INK, loc="left", fontsize=13, pad=26)
     ax.legend(frameon=False, loc="lower right", bbox_to_anchor=(1, 1.0), ncol=2, labelcolor=INK)
-    ax.annotate("Train error is measured with dropout active, so it is slightly pessimistic.",
-                xy=(0, -0.16), xycoords="axes fraction", color=MUTED, fontsize=8, ha="left", va="top")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
