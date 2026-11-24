@@ -116,12 +116,23 @@ def train(args): # train the model using the specified arguments
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_fn = nn.BCEWithLogitsLoss() if args.target == "like" else nn.MSELoss()
 
-    # baseline for context
+    u, m, r = t["train"] # pull out the training set user indices, movie indices, and ratings
+
+    # per-movie mean of the target on the training set (global mean for movies with no training ratings);
+    # used as a popularity baseline and to re-rank recommendations by personalization
+    n_movies = len(d["movie_ids"])
+    y_train = make_target(r, args.target, args.like_threshold).cpu().double() # on the CPU because MPS has no float64
+    m_cpu = m.cpu()
+    cnt = torch.bincount(m_cpu, minlength=n_movies).double()
+    tot = torch.bincount(m_cpu, weights=y_train, minlength=n_movies)
+    movie_mean = torch.where(cnt > 0, tot / cnt.clamp(min=1.0), y_train.mean()).float().numpy()
+
+    # baselines for context
     vu, vm, vr = t["val"] # pull out the validation set user indices, movie indices, and ratings
     if args.target == "rating":
         print(f"baseline (predict train mean) val RMSE: {((vr - train_mean) ** 2).mean().sqrt():.4f}")
-
-    u, m, r = t["train"] # pull out the training set user indices, movie indices, and ratings
+        mm_pred = torch.as_tensor(movie_mean, device=device)[vm]
+        print(f"baseline (predict movie mean) val RMSE: {((vr - mm_pred) ** 2).mean().sqrt():.4f}")
     best, best_state, bad = float("inf"), None, 0 # initialize the best score, best model state, and bad epoch counter for early stopping
     for epoch in range(1, args.epochs + 1): # repeats through epochs
         model.train() # set the model to training mode
@@ -157,6 +168,7 @@ def train(args): # train the model using the specified arguments
                        dropout=args.dropout, target=args.target, like_threshold=args.like_threshold),
         "user_ids": d["user_ids"], "movie_ids": d["movie_ids"], "titles": d["titles"],
         "genre_mat": d["genre_mat"], "tag_mat": d["tag_mat"], "movie_counts": d["movie_counts"],
+        "movie_mean": movie_mean,
         "seen_indptr": indptr, "seen_items": items, "seen_ratings": seen_ratings,
     }, CKPT)
     print("saved", CKPT)
@@ -168,9 +180,11 @@ Recommends movies to a specific user without training the model (need to run tra
 * user_id : MovieLens userId to recommend for
 * top_k : number of recommendations to return
 * min_count : only recommend movies with at least this many training ratings
+* alpha : popularity penalty; movies are ranked by score - alpha * movie_mean, so alpha=0 ranks by the
+          raw score and alpha=1 ranks by how much the model expects this user to deviate from the movie's average
 """
 @torch.no_grad()
-def recommend(user_id, top_k, min_count): 
+def recommend(user_id, top_k, min_count, alpha=0.0):
     ck = torch.load(CKPT, weights_only=False) # load the checkpoint file
     c = ck["config"]
     model = RecMLP(c["n_users"], c["n_movies"], ck["genre_mat"], ck["tag_mat"], c["n_tags"],
@@ -188,15 +202,21 @@ def recommend(user_id, top_k, min_count):
     if c["target"] == "like": # if the target is "like", apply the sigmoid function to convert logits to probabilities
         scores = torch.sigmoid(scores)
     scores = scores.numpy()
-    scores[seen] = -np.inf # only use unseen movies
-    scores[ck["movie_counts"] < min_count] = -np.inf  # skip obscure titles
+    if alpha > 0: # if there was an alpha, apply a popularity penalty to the scores by subtracting alpha times the movie's mean rating from the scores
+        if "movie_mean" not in ck:
+            raise SystemExit("checkpoint has no movie_mean; retrain to use --rerank-alpha")
+        rank_scores = scores - alpha * ck["movie_mean"] # remove the movie's baseline popularity from the ranking
+    else:
+        rank_scores = scores.copy()
+    rank_scores[seen] = -np.inf # only use unseen movies
+    rank_scores[ck["movie_counts"] < min_count] = -np.inf  # skip obscure titles
     label = "P(like)" if c["target"] == "like" else "pred rating"
     seen_r = ck["seen_ratings"][ck["seen_indptr"][pos]:ck["seen_indptr"][pos + 1]]  # the user's actual ratings
     print(f"\nUser's top {top_k} rated movies (for context):")
     for rank, i in enumerate(np.argsort(-seen_r, kind="stable")[:top_k], 1): # print the user's top rated movies to sanity check their recommendations
         print(f"{rank:2d}. {ck['titles'][seen[i]]:<60} rating: {seen_r[i]:.1f}")
     print(f"\nTop {top_k} recommendations for user {user_id} ({len(seen)} movies already rated):")
-    for rank, i in enumerate(np.argsort(-scores)[:top_k], 1): # print the user's top recommended movies with their predicted ratings
+    for rank, i in enumerate(np.argsort(-rank_scores)[:top_k], 1): # print the user's top recommended movies with their predicted ratings
         val = f"{scores[i]:.1%}" if c["target"] == "like" else f"{min(scores[i], 5.0):.2f}"
         print(f"{rank:2d}. {ck['titles'][i]:<60} {label}: {val}")
 
@@ -209,6 +229,8 @@ def main():
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--rec-min-ratings", type=int, default=50,
                    help="only recommend movies with at least this many training ratings")
+    p.add_argument("--rerank-alpha", type=float, default=0.0,
+                   help="rank by score - alpha * movie_mean to reduce popularity bias (0 = raw score)")
     p.add_argument("--target", choices=["rating", "like"], default="rating")
     p.add_argument("--like-threshold", type=float, default=4.0)
     p.add_argument("--sample-users", type=int, default=20000,
@@ -231,7 +253,7 @@ def main():
     if args.mode == "train":
         train(args)
     if args.user_id is not None:
-        recommend(args.user_id, args.top_k, args.rec_min_ratings) # recommend based on a user id, top k recommendations, and minimum ratings
+        recommend(args.user_id, args.top_k, args.rec_min_ratings, args.rerank_alpha) # recommend based on a user id, top k recommendations, and minimum ratings
     elif args.mode == "recommend":
         p.error("recommend requires --user-id")
 
